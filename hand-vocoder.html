@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hand Vocoder</title>
+<style>
+:root{--bg:#07070a;--ink:#f2efe8;--dim:#7d7f8a;--fist:#ffb547;--open:#5be3c4}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font:14px/1.4 ui-monospace,"SF Mono",Menlo,Consolas,monospace;overflow:hidden}
+#stage{position:fixed;inset:0}
+video{display:none}
+canvas{position:absolute;inset:0;width:100%;height:100%}
+.hud{position:absolute;left:24px;top:22px;pointer-events:none}
+.mode{font-size:clamp(34px,7vw,84px);font-weight:800;letter-spacing:-.03em;line-height:.95;text-transform:uppercase;transition:color .25s}
+.sub{color:var(--dim);margin-top:10px;font-size:13px;max-width:420px}
+.meter{position:absolute;right:24px;top:24px;width:14px;height:200px;border:1px solid #2a2c35;border-radius:8px;overflow:hidden}
+.meter i{position:absolute;left:0;right:0;bottom:0;background:var(--open);transition:height .08s}
+.meter b{position:absolute;right:22px;top:-2px;font-weight:400;color:var(--dim);font-size:11px;white-space:nowrap}
+.note{position:absolute;right:24px;bottom:22px;color:var(--dim);font-size:12px;text-align:right}
+#start{position:absolute;inset:0;display:grid;place-items:center;background:radial-gradient(circle at 50% 45%,#16171d,#07070a 70%);z-index:5}
+.card{text-align:center;max-width:460px;padding:24px}
+.card h1{font-size:46px;margin:0 0 6px;letter-spacing:-.04em}
+.card h1 span{color:var(--open)} .card h1 em{color:var(--fist);font-style:normal}
+.card p{color:var(--dim);margin:8px 0}
+.card button{margin-top:18px;font:inherit;font-size:16px;font-weight:700;padding:14px 30px;border-radius:40px;border:0;background:var(--ink);color:#000;cursor:pointer}
+.card .warn{color:#ffcf8a;font-size:12px;margin-top:16px}
+#err{color:#ff8a7a;margin-top:12px;font-size:13px;white-space:pre-wrap}
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="cam" playsinline muted></video>
+  <canvas id="view"></canvas>
+  <div class="hud">
+    <div class="mode" id="mode">show a hand</div>
+    <div class="sub" id="sub">✊ fist = melody · ✋ open = vocoder (sing or talk!)</div>
+  </div>
+  <div class="meter"><i id="lvl"></i><b>voice</b></div>
+  <div class="note" id="note"></div>
+</div>
+<div id="start"><div class="card">
+  <h1><em>✊</em> hand <span>vocoder</span></h1>
+  <p>One hand. Close it for melodies. Open it and talk or sing — your voice becomes a robot choir.</p>
+  <p>Up / down = pitch &nbsp;·&nbsp; left / right = brightness</p>
+  <button id="go">Start camera + mic</button>
+  <div class="warn">🎧 Use headphones, otherwise the mic hears the speakers and howls.</div>
+  <div id="err"></div>
+</div></div>
+
+<script type="module">
+import {FilesetResolver, HandLandmarker} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const $=id=>document.getElementById(id);
+const video=$('cam'), cv=$('view'), ctx=cv.getContext('2d');
+let landmarker, ac, S={};               // S = sound engine parts
+let hand=null, openness=0, state='none', smoothY=.5, smoothX=.5;
+
+// ---------- music helpers ----------
+const SCALE=[0,3,5,7,10];                                    // minor pentatonic
+const midi=n=>440*Math.pow(2,(n-69)/12);
+const CHORDS=[[0,3,7,10],[ -4,0,3,7],[-2,2,5,9],[-7,-3,0,5],[3,7,10,14],[5,8,12,15]];  // relative to root
+
+// ---------- audio ----------
+async function setupAudio(micStream){
+  ac=new (window.AudioContext||window.webkitAudioContext)();
+  const master=ac.createGain(); master.gain.value=.8;
+  const comp=ac.createDynamicsCompressor(); comp.threshold.value=-18; comp.ratio.value=4;
+  master.connect(comp).connect(ac.destination);
+
+  // shared echo
+  const dl=ac.createDelay(1); dl.delayTime.value=.375; const fb=ac.createGain(); fb.gain.value=.38;
+  const dlf=ac.createBiquadFilter(); dlf.type='lowpass'; dlf.frequency.value=2600;
+  dl.connect(dlf).connect(fb).connect(dl); const wet=ac.createGain(); wet.gain.value=.35; dl.connect(wet).connect(master);
+
+  /* ===== MELODY (fist) ===== */
+  const melBus=ac.createGain(); melBus.gain.value=0;
+  const melFilt=ac.createBiquadFilter(); melFilt.type='lowpass'; melFilt.frequency.value=2000; melFilt.Q.value=6;
+  melBus.connect(melFilt); melFilt.connect(master); melFilt.connect(dl);
+  // sub bass drone
+  const bass=ac.createOscillator(); bass.type='triangle'; const bassG=ac.createGain(); bassG.gain.value=.22;
+  bass.connect(bassG).connect(melBus); bass.start();
+
+  /* ===== VOCODER (open hand) ===== */
+  const vocBus=ac.createGain(); vocBus.gain.value=0; vocBus.connect(master); vocBus.connect(dl);
+  const mic=ac.createMediaStreamSource(micStream);
+  const micHP=ac.createBiquadFilter(); micHP.type='highpass'; micHP.frequency.value=90;
+  const micBoost=ac.createGain(); micBoost.gain.value=2.5; mic.connect(micHP).connect(micBoost);
+  const analyser=ac.createAnalyser(); analyser.fftSize=512; micBoost.connect(analyser);
+
+  // carrier: detuned saw chord + a bit of noise for "s" and "t" sounds
+  const carrier=ac.createGain(); carrier.gain.value=1;
+  const vOsc=[];
+  for(let i=0;i<8;i++){const o=ac.createOscillator(); o.type='sawtooth'; o.detune.value=(i%2?7:-7); const g=ac.createGain(); g.gain.value=.18; o.connect(g).connect(carrier); o.start(); vOsc.push(o);}
+  const nbuf=ac.createBuffer(1,ac.sampleRate*2,ac.sampleRate), nd=nbuf.getChannelData(0); for(let i=0;i<nd.length;i++)nd[i]=Math.random()*2-1;
+  const noise=ac.createBufferSource(); noise.buffer=nbuf; noise.loop=true; const ng=ac.createGain(); ng.gain.value=.12; noise.connect(ng).connect(carrier); noise.start();
+
+  // filter bank: voice band loudness controls the same band of the synth
+  const rect=ac.createWaveShaper(); const curve=new Float32Array(1024); for(let i=0;i<1024;i++)curve[i]=Math.abs(i/511.5-1); rect.curve=curve;
+  const BANDS=20, lo=110, hi=7000;
+  for(let b=0;b<BANDS;b++){
+    const f=lo*Math.pow(hi/lo,b/(BANDS-1)), Q=7;
+    const mb=ac.createBiquadFilter(); mb.type='bandpass'; mb.frequency.value=f; mb.Q.value=Q;
+    const r=ac.createWaveShaper(); r.curve=curve;
+    const env=ac.createBiquadFilter(); env.type='lowpass'; env.frequency.value=28;
+    const envGain=ac.createGain(); envGain.gain.value=9*(1+b/BANDS);   // more lift on highs
+    micBoost.connect(mb).connect(r).connect(env).connect(envGain);
+    const cb=ac.createBiquadFilter(); cb.type='bandpass'; cb.frequency.value=f; cb.Q.value=Q;
+    const vca=ac.createGain(); vca.gain.value=0; envGain.connect(vca.gain);
+    carrier.connect(cb).connect(vca).connect(vocBus);
+  }
+  const vocTone=ac.createBiquadFilter(); vocTone.type='highshelf'; vocTone.frequency.value=3000; vocTone.gain.value=0;
+  vocBus.disconnect(); vocBus.connect(vocTone); vocTone.connect(master); vocTone.connect(dl);
+
+  S={master,melBus,melFilt,bass,vocBus,vOsc,vocTone,analyser,step:0,next:ac.currentTime+.1};
+}
+
+// melody sequencer: plays 16th notes ahead of time
+const PATTERN=[0,2,4,2, 5,4,2,1, 0,2,4,6, 5,3,2,4];
+function scheduler(){
+  if(!ac)return;
+  const bpm=112, sixteenth=60/bpm/4;
+  while(S.next<ac.currentTime+.12){
+    const st=S.step%16, bar=Math.floor(S.step/16)%4;
+    const lift=Math.round((1-smoothY)*10);                    // hand height → scale degrees
+    const degree=PATTERN[st]+[0,2,-1,3][bar]+lift;
+    const oct=Math.floor(degree/5), n=57+oct*12+SCALE[((degree%5)+5)%5];
+    if(state==='fist' && !(st%4===3 && bar%2)) pluck(midi(n),S.next,sixteenth*(st%4===0?2.2:1.2), st%4===0?.3:.2);
+    if(st===0) S.bass.frequency.setTargetAtTime(midi(33+lift%5*0+[0,-2,3,-4][bar]),S.next,.05);
+    S.next+=sixteenth; S.step++;
+  }
+}
+function pluck(f,t,len,vel){
+  const g=ac.createGain(); g.gain.setValueAtTime(0,t); g.gain.linearRampToValueAtTime(vel,t+.006); g.gain.exponentialRampToValueAtTime(.0008,t+len+.25);
+  const a=ac.createOscillator(), b=ac.createOscillator(); a.type='square'; b.type='sawtooth'; a.frequency.value=f; b.frequency.value=f*2.003;
+  const bg=ac.createGain(); bg.gain.value=.35; a.connect(g); b.connect(bg).connect(g); g.connect(S.melBus);
+  a.start(t); b.start(t); a.stop(t+len+.3); b.stop(t+len+.3);
+}
+
+function updateSound(){
+  if(!ac)return; const now=ac.currentTime;
+  const fistOn=state==='fist', openOn=state==='open';
+  S.melBus.gain.setTargetAtTime(fistOn?1:0,now,.08);
+  S.vocBus.gain.setTargetAtTime(openOn?1.1:0,now,.06);
+  S.melFilt.frequency.setTargetAtTime(400+Math.pow(smoothX,1.6)*7000,now,.05);
+  S.vocTone.gain.setTargetAtTime(-8+smoothX*18,now,.05);
+  // vocoder chord follows hand height
+  const idx=Math.max(0,Math.min(CHORDS.length-1,Math.floor((1-smoothY)*CHORDS.length)));
+  const root=45, ch=CHORDS[idx];
+  S.vOsc.forEach((o,i)=>o.frequency.setTargetAtTime(midi(root+ch[i%4]+(i>=4?12:0)),now,.04));
+  $('note').textContent=openOn?'chord '+(idx+1)+' / '+CHORDS.length:fistOn?'melody · tone '+Math.round(smoothX*100)+'%':'';
+}
+
+// ---------- hand tracking ----------
+const dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+function classify(lm){
+  const palm=dist(lm[0],lm[9])||1e-3;
+  const tips=[8,12,16,20].map(i=>dist(lm[i],lm[0])/palm);
+  const o=tips.reduce((s,v)=>s+v,0)/4;               // ~1.0 fist … ~2.0 open
+  openness+= (Math.max(0,Math.min(1,(o-1.05)/.8))-openness)*.4;
+  if(state!=='open'&&openness>.62)state='open';
+  else if(state!=='fist'&&openness<.38)state='fist';
+  else if(state==='none')state=openness>.5?'open':'fist';
+}
+
+const LINKS=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+let lastVideoTime=-1;
+function loop(){
+  requestAnimationFrame(loop);
+  const W=cv.width=innerWidth*devicePixelRatio, H=cv.height=innerHeight*devicePixelRatio;
+  if(video.readyState>=2 && video.currentTime!==lastVideoTime){
+    lastVideoTime=video.currentTime;
+    const r=landmarker.detectForVideo(video,performance.now());
+    hand=r.landmarks&&r.landmarks[0]||null;
+  }
+  if(hand){ classify(hand); const c=hand[9]; smoothY+=(c.y-smoothY)*.25; smoothX+=((1-c.x)-smoothX)*.25; }
+  else state='none';
+
+  // draw mirrored camera, dimmed
+  const vw=video.videoWidth||16, vh=video.videoHeight||9, sc=Math.max(W/vw,H/vh), dw=vw*sc, dh=vh*sc, ox=(W-dw)/2, oy=(H-dh)/2;
+  ctx.save(); ctx.translate(W,0); ctx.scale(-1,1); ctx.globalAlpha=.32; ctx.drawImage(video,ox,oy,dw,dh); ctx.restore(); ctx.globalAlpha=1;
+  const col=state==='open'?'#5be3c4':state==='fist'?'#ffb547':'#555';
+  // pitch guide lines
+  ctx.strokeStyle='rgba(255,255,255,.06)';ctx.lineWidth=1;
+  for(let i=1;i<6;i++){const y=H*i/6;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
+  if(hand){
+    const P=p=>[W-(ox+p.x*dw),oy+p.y*dh];
+    ctx.strokeStyle=col;ctx.lineWidth=4*devicePixelRatio;ctx.lineCap='round';ctx.shadowColor=col;ctx.shadowBlur=24;
+    for(const[a,b]of LINKS){const A=P(hand[a]),B=P(hand[b]);ctx.beginPath();ctx.moveTo(...A);ctx.lineTo(...B);ctx.stroke();}
+    ctx.fillStyle='#fff';for(const p of hand){const[x,y]=P(p);ctx.beginPath();ctx.arc(x,y,4*devicePixelRatio,0,7);ctx.fill();}
+    // energy ring when vocoding
+    if(state==='open'){const[x,y]=P(hand[9]);const lv=level();ctx.beginPath();ctx.lineWidth=3*devicePixelRatio;ctx.arc(x,y,(60+lv*260)*devicePixelRatio,0,7);ctx.stroke();}
+    ctx.shadowBlur=0;
+  }
+  const m=$('mode'); m.style.color=col;
+  m.textContent=state==='open'?'vocoder':state==='fist'?'melody':'show a hand';
+  $('lvl').style.height=Math.min(100,level()*300)+'%';
+  updateSound(); scheduler();
+}
+let lvBuf=null;
+function level(){ if(!S.analyser)return 0; lvBuf=lvBuf||new Float32Array(S.analyser.fftSize); S.analyser.getFloatTimeDomainData(lvBuf);
+  let s=0;for(const v of lvBuf)s+=v*v; return Math.sqrt(s/lvBuf.length); }
+
+$('go').onclick=async()=>{
+  const btn=$('go'); btn.disabled=true; btn.textContent='loading hand tracker…'; $('err').textContent='';
+  try{
+    const cam=await navigator.mediaDevices.getUserMedia({video:{width:1280,height:720,facingMode:'user'},
+      audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+    video.srcObject=new MediaStream(cam.getVideoTracks()); await video.play();
+    await setupAudio(new MediaStream(cam.getAudioTracks()));
+    const vision=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    landmarker=await HandLandmarker.createFromOptions(vision,{
+      baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",delegate:"GPU"},
+      runningMode:"VIDEO",numHands:1});
+    $('start').remove(); loop();
+  }catch(e){
+    btn.disabled=false; btn.textContent='Try again';
+    $('err').textContent=(e.name==='NotAllowedError'?'Camera / mic permission was blocked. Allow it in the address bar and try again.':
+      e.name==='NotFoundError'?'No camera or microphone found.':'Could not start: '+e.message)+
+      '\n(It needs an internet connection the first time, to load the hand tracker.)';
+  }
+};
+</script>
+</body>
+</html>
